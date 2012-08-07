@@ -1004,7 +1004,7 @@ bool CameraService::Client::lockIfMessageWanted(int32_t msgType) {
         }
         usleep(CHECK_MESSAGE_INTERVAL * 1000);
     }
-    ALOGW("lockIfMessageWanted(%d): dropped unwanted message", msgType);
+    //ALOGW("lockIfMessageWanted(%d): dropped unwanted message", msgType);
     return false;
 }
 
