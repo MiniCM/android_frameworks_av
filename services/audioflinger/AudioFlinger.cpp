@@ -108,6 +108,7 @@
 #endif
 
 #define LPA_EOS 1
+static const char lockName[] = "DirectTrack";
 namespace android {
 
 static const char kDeadlockedString[] = "AudioFlinger may be deadlocked\n";
@@ -245,6 +246,9 @@ AudioFlinger::AudioFlinger()
 void AudioFlinger::onFirstRef()
 {
     int rc = 0;
+#ifdef QCOM_HARDWARE
+    mA2DPHandle = -1;
+#endif
 
     Mutex::Autolock _l(mLock);
 
@@ -722,6 +726,9 @@ status_t AudioFlinger::setMasterVolume(float value)
 
     float swmv = value;
 
+#ifdef QCOM_HARDWARE
+    mA2DPHandle = -1;
+#endif
     Mutex::Autolock _l(mLock);
 
     // when hw supports master volume, don't scale in sw mixer
@@ -1239,6 +1246,16 @@ void AudioFlinger::registerClient(const sp<IAudioFlingerClient>& client)
 
     Mutex::Autolock _l(mLock);
 
+#ifdef QCOM_HARDWARE
+    sp<IBinder> binder = client->asBinder();
+    if (mNotificationClients.indexOfKey(binder) < 0) {
+        sp<NotificationClient> notificationClient = new NotificationClient(this,
+                                                                            client,
+                                                                            binder);
+        ALOGV("registerClient() client %p, binder %d", notificationClient.get(), binder.get());
+
+        mNotificationClients.add(binder, notificationClient);
+#else
     pid_t pid = IPCThreadState::self()->getCallingPid();
     if (mNotificationClients.indexOfKey(pid) < 0) {
         sp<NotificationClient> notificationClient = new NotificationClient(this,
@@ -1247,6 +1264,7 @@ void AudioFlinger::registerClient(const sp<IAudioFlingerClient>& client)
         ALOGV("registerClient() client %p, pid %d", notificationClient.get(), pid);
 
         mNotificationClients.add(pid, notificationClient);
+#endif
 
         sp<IBinder> binder = client->asBinder();
         binder->linkToDeath(notificationClient);
@@ -1261,14 +1279,46 @@ void AudioFlinger::registerClient(const sp<IAudioFlingerClient>& client)
             mRecordThreads.valueAt(i)->sendConfigEvent(AudioSystem::INPUT_OPENED);
         }
     }
+#ifdef QCOM_HARDWARE
+    // Send the notification to the client only once.
+    if (mA2DPHandle != -1) {
+        ALOGV("A2DP active. Notifying the registered client");
+        client->ioConfigChanged(AudioSystem::A2DP_OUTPUT_STATE, mA2DPHandle, &mA2DPHandle);
+    }
+#endif
 }
 
+#ifdef QCOM_HARDWARE
+status_t AudioFlinger::deregisterClient(const sp<IAudioFlingerClient>& client)
+#else
 void AudioFlinger::removeNotificationClient(pid_t pid)
+#endif
+{
+#ifdef QCOM_HARDWARE
+    ALOGV("deregisterClient() %p, tid %d, calling tid %d", client.get(), gettid(), IPCThreadState::self()->getCallingPid());
+#endif
+    Mutex::Autolock _l(mLock);
+
+#ifndef QCOM_HARDWARE
+    mNotificationClients.removeItem(pid);
+#else
+    sp<IBinder> binder = client->asBinder();
+    int index = mNotificationClients.indexOfKey(binder);
+    if (index >= 0) {
+        mNotificationClients.removeItemsAt(index);
+        return true;
+    }
+    return false;
+}
+
+void AudioFlinger::removeNotificationClient(sp<IBinder> binder)
 {
     Mutex::Autolock _l(mLock);
 
-    mNotificationClients.removeItem(pid);
+    mNotificationClients.removeItem(binder);
 
+    int pid = IPCThreadState::self()->getCallingPid();
+#endif
     ALOGV("%d died, releasing its sessions", pid);
     size_t num = mAudioSessionRefs.size();
     bool removed = false;
@@ -6096,8 +6146,13 @@ void AudioFlinger::Client::releaseTimedTrack()
 
 AudioFlinger::NotificationClient::NotificationClient(const sp<AudioFlinger>& audioFlinger,
                                                      const sp<IAudioFlingerClient>& client,
+#ifdef QCOM_HARDWARE
+                                                     sp<IBinder> binder)
+    : mAudioFlinger(audioFlinger), mBinder(binder), mAudioFlingerClient(client)
+#else
                                                      pid_t pid)
     : mAudioFlinger(audioFlinger), mPid(pid), mAudioFlingerClient(client)
+#endif
 {
 }
 
@@ -6108,7 +6163,11 @@ AudioFlinger::NotificationClient::~NotificationClient()
 void AudioFlinger::NotificationClient::binderDied(const wp<IBinder>& who)
 {
     sp<NotificationClient> keep(this);
+#ifdef QCOM_HARDWARE
+    mAudioFlinger->removeNotificationClient(mBinder);
+#else
     mAudioFlinger->removeNotificationClient(mPid);
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -6124,6 +6183,8 @@ AudioFlinger::DirectAudioTrack::DirectAudioTrack(const sp<AudioFlinger>& audioFl
     LOGD("SRS_Processing - DirectAudioTrack - OutNotify_Init: %p TID %d\n", this, gettid());
     SRS_Processing::ProcessOutNotify(SRS_Processing::AUTO, this, true);
 #endif
+    mDeathRecipient = new PMDeathRecipient(this);
+    acquireWakeLock();
 }
 
 AudioFlinger::DirectAudioTrack::~DirectAudioTrack() {
@@ -6131,6 +6192,12 @@ AudioFlinger::DirectAudioTrack::~DirectAudioTrack() {
     LOGD("SRS_Processing - DirectAudioTrack - OutNotify_Init: %p TID %d\n", this, gettid());
     SRS_Processing::ProcessOutNotify(SRS_Processing::AUTO, this, false);
 #endif
+    releaseWakeLock();
+
+    if (mPowerManager != 0) {
+        sp<IBinder> binder = mPowerManager->asBinder();
+        binder->unlinkToDeath(mDeathRecipient);
+    }
     AudioSystem::releaseOutput(mOutput);
 }
 
@@ -6192,6 +6259,59 @@ status_t AudioFlinger::DirectAudioTrack::onTransact(
     uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
 {
     return BnDirectTrack::onTransact(code, data, reply, flags);
+}
+
+void AudioFlinger::DirectAudioTrack::acquireWakeLock()
+{
+    Mutex::Autolock _l(pmLock);
+
+    if (mPowerManager == 0) {
+        // use checkService() to avoid blocking if power service is not up yet
+        sp<IBinder> binder =
+            defaultServiceManager()->checkService(String16("power"));
+        if (binder == 0) {
+            ALOGW("Thread %s cannot connect to the power manager service", lockName);
+        } else {
+            mPowerManager = interface_cast<IPowerManager>(binder);
+            binder->linkToDeath(mDeathRecipient);
+        }
+    }
+    if (mPowerManager != 0 && mWakeLockToken == 0) {
+        sp<IBinder> binder = new BBinder();
+        status_t status = mPowerManager->acquireWakeLock(POWERMANAGER_PARTIAL_WAKE_LOCK,
+                                                         binder,
+                                                         String16(lockName));
+        if (status == NO_ERROR) {
+            mWakeLockToken = binder;
+        }
+        ALOGV("acquireWakeLock() %s status %d", mName, status);
+    }
+}
+
+void AudioFlinger::DirectAudioTrack::releaseWakeLock()
+{
+   Mutex::Autolock _l(pmLock);
+
+    if (mWakeLockToken != 0) {
+        ALOGV("releaseWakeLock() %s", mName);
+        if (mPowerManager != 0) {
+            mPowerManager->releaseWakeLock(mWakeLockToken, 0);
+        }
+        mWakeLockToken.clear();
+    }
+}
+
+void AudioFlinger::DirectAudioTrack::clearPowerManager()
+{
+    Mutex::Autolock _l(pmLock);
+    releaseWakeLock();
+    mPowerManager.clear();
+}
+
+void AudioFlinger::DirectAudioTrack::PMDeathRecipient::binderDied(const wp<IBinder>& who)
+{
+    parentClass->clearPowerManager();
+    ALOGW("power manager service died !!!");
 }
 #endif
 
@@ -7380,6 +7500,16 @@ audio_io_handle_t AudioFlinger::openOutput(audio_module_handle_t module,
 #endif
             mPlaybackThreads.add(id, thread);
 
+#ifdef QCOM_HARDWARE
+        // if the device is a A2DP, then this is an A2DP Output
+        if ( true == audio_is_a2dp_device((audio_devices_t) *pDevices) )
+        {
+            mA2DPHandle = id;
+            ALOGV("A2DP device activated. The handle is set to %d", mA2DPHandle);
+        }
+#endif
+
+
         if (pSamplingRate != NULL) *pSamplingRate = config.sample_rate;
         if (pFormat != NULL) *pFormat = config.format;
         if (pChannelMask != NULL) *pChannelMask = config.channel_mask;
@@ -7507,6 +7637,14 @@ status_t AudioFlinger::closeOutput(audio_io_handle_t output)
         }
         audioConfigChanged_l(AudioSystem::OUTPUT_CLOSED, output, NULL);
         mPlaybackThreads.removeItem(output);
+#ifdef QCOM_HARDWARE
+        if (mA2DPHandle == output)
+        {
+            mA2DPHandle = -1;
+            ALOGV("A2DP OutputClosed Notifying Client");
+            audioConfigChanged_l(AudioSystem::A2DP_OUTPUT_STATE, mA2DPHandle, &mA2DPHandle);
+        }
+#endif
     }
     thread->exit();
     // The thread entity (active unit of execution) is no longer running here,
@@ -7703,6 +7841,13 @@ status_t AudioFlinger::setStreamOutput(audio_stream_type_t stream, audio_io_hand
             srcThread->invalidateTracks(stream);
         }
     }
+
+#ifdef QCOM_HARDWARE
+    if ( mA2DPHandle == output ) {
+        ALOGV("A2DP Activated and hence notifying the client");
+        audioConfigChanged_l(AudioSystem::A2DP_OUTPUT_STATE, mA2DPHandle, &output);
+    }
+#endif
 
     return NO_ERROR;
 }
