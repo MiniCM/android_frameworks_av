@@ -78,9 +78,9 @@ bool WVMExtractor::getVendorLibHandle()
         gVendorLibHandle = dlopen("libwvm.so", RTLD_NOW);
     }
 
-    if (gVendorLibHandle == NULL) {
+    /*if (gVendorLibHandle == NULL) {
         ALOGW("Failed to open libwvm.so");
-    }
+    }*/
 
     return gVendorLibHandle != NULL;
 }
